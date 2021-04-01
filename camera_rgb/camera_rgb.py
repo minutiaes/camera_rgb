@@ -1,97 +1,107 @@
 #!/usr/bin/env python3
-import time
+import os
 import yaml
+from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.node import Node
 import cv2 as cv
 import numpy as np
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from cv_bridge import CvBridge, CvBridgeError
-from sensor_msgs.msg import CameraInfo
+
 
 class CameraPublisher(Node):
-    def __init__(self, source=0, width=640, height=480, fps=30):
+    def __init__(self):
         super().__init__("camera_publisher")
+        self.publisher_raw = self.create_publisher(Image, "camera/image_color", 5)
+        self.publisher_rect = self.create_publisher(Image, "camera/image_undist_color", 5)
+        self.publisher_info = self.create_publisher(CameraInfo, "camera/camera_info", 10)
 
-        self.publisher_ = self.create_publisher(Image, "camera/image", 100)
-        self.publisher_info = self.create_publisher(CameraInfo, "camera/camera_info", 100)
-        self.source = source
-        self.width = width
-        self.height = height
-        self.fps = fps
+        self.cam_info = self.read_config()
+        self.width = self.cam_info["image_width"]
+        self.height = self.cam_info["image_height"]
+        self.source = self.cam_info["camera_source"]
+        self.fps = self.cam_info["camera_fps"]
+        self.name = self.cam_info["camera_name"]
+        self.mtx = np.array(self.cam_info["camera_matrix"]["data"]).reshape((3, 3))
+        self.dist_model = self.cam_info["distortion_model"]
+        self.dist = np.array(self.cam_info["distortion_coefficients"]["data"])
 
+        self.msg_cam_info = self.msg_set()
+        self.declare_parameters(
+            namespace="",
+            parameters=[
+                ("read_video", None),
+                ("video_path", None),
+            ]
+        )
+        self.read_video = self.get_parameter(name="read_video").get_parameter_value().bool_value
+        self.video_path = self.get_parameter(name="video_path").get_parameter_value().string_value
         self.image_publisher()
 
 
-    def info_set(self):
-        data1 = [679.0077123045467, 0.0, 356.3515350783442, 0.0, 672.9969017826554, 196.5430429125135, 0.0, 0.0, 1.0]
-        data2 = [0.260086, -0.025048, 0.089063, 0.138628, 0.000000]
-        data3 = [1.000000, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000, 0.000000, 0.000000, 1.000000]
-        data4 = [852.395142, 0.000000, 565.897630, 0.000000, 0.000000, 922.066223, 386.586250, 0.000000, 0.000000, 0.000000, 1.000000, 0.000000]
-        people = {'image_width': 640,
-          'image_height': 480,
-          'camera_name': "camera",
-          "camera_matrix": {'rows': 3, 'cols': 3, 'data': data1},
-          "distortion_model": "plumb_bob",
-          "distortion_coefficients": {'rows': 1, 'cols': 5, 'data': data2},
-          "rectification_matrix": {'rows': 3, 'cols': 3, 'data': data3},
-          "projection_matrix": {'rows': 3, 'cols': 4, 'data': data4}}
 
+    @classmethod
+    def read_config(cls):
+        """reads YAML file"""
+        config_file = os.path.join(
+            get_package_share_directory('camera_rgb'), 'config', 'camera.yaml')
+        with open(config_file, 'r') as f:
+            return yaml.load(f, Loader=yaml.FullLoader)
+
+
+    def msg_set(self):
+        """prepares CameraInfo msg"""
         msg = CameraInfo()
-        msg.header.frame_id = people["camera_name"]
-        msg.height = people["image_height"]
-        msg.width = people["image_width"]
-        msg.distortion_model = people["distortion_model"]
-        msg.d = people["distortion_coefficients"]["data"]
-        msg.k = people["camera_matrix"]["data"]
-        msg.r = people["rectification_matrix"]["data"]
-        msg.p = people["projection_matrix"]["data"]
+        msg.header.frame_id = self.name
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.height = self.height
+        msg.width = self.width
+        msg.distortion_model = self.dist_model
+        msg.d = self.cam_info["distortion_coefficients"]["data"]
+        msg.k = self.cam_info["camera_matrix"]["data"]
 
-        self.publisher_info.publish(msg)
-        # with open(r'test.yaml', 'w+') as f:
-        #     y = ""
-        #     for x in str(yaml.dump(people, sort_keys=False, default_flow_style=False)):
-        #         if x == "'":
-        #             pass
-        #         else:
-        #             y = y + x
-        #     f.write(y)
+        return msg
+
     def image_publisher(self):
-        cap = cv.VideoCapture(self.source)
-        cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc('M', 'J', 'P', 'G')) # depends on fourcc available camera
-        cap.set(cv.CAP_PROP_FRAME_WIDTH, self.width)
-        cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.height)
-        cap.set(cv.CAP_PROP_FPS, self.fps)
+        if not self.read_video:
+            # from camera
+            cap = cv.VideoCapture(self.source)
+            cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            cap.set(cv.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv.CAP_PROP_FRAME_HEIGHT, self.height)
+            cap.set(cv.CAP_PROP_FPS, self.fps)
 
+            newcameramtx, roi = cv.getOptimalNewCameraMatrix(self.mtx, self.dist, (self.width, self.height), 1, (self.width, self.height))
+            mapx, mapy = cv.initUndistortRectifyMap(self.mtx, self.dist, None, newcameramtx, (self.width, self.height), 5)
+        elif self.read_video:
+            # from video
+            cap = cv.VideoCapture(self.video_path)
+            cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc('M','P','4','2'))
+        if not cap.isOpened():
+            self.get_logger().info(f"camera or video file couldn't be opened!")
         bridge = CvBridge()
-        frame_id_ = 1
-
-        mtx = [633.9817971, 0.0, 319.34040276, 0.0, 632.24890996, 196.56498982, 0.0, 0.0, 1.0]
-        mtx = np.array(mtx)
-        mtx = mtx.reshape((3,3))
-        dist = [-0.42858939, 0.22824651, 0.00167929, 0.0033874, -0.11409583]
-        dist = np.array(dist)
         while True:
             ret, frame = cap.read()
-            
+
             if ret:
                 try:
-                    h,  w = frame.shape[:2]
-                    newcameramtx, roi = cv.getOptimalNewCameraMatrix(mtx, dist, (w,h), 1, (w,h))
-                    frame = cv.undistort(frame, mtx, dist, None, newcameramtx)
-                    msg = bridge.cv2_to_imgmsg(np.array(frame), encoding="bgr8")
-                    msg.header.stamp.sec = int(time.time())
+                    if not self.read_video:
+                        # undistortion
+                        frame_rect = cv.remap(frame, mapx, mapy, cv.INTER_LINEAR)
+                    elif self.read_video:
+                        frame_rect = frame
+                    msg = bridge.cv2_to_imgmsg(np.array(frame_rect), "bgr8")
+                    msg.header.stamp = self.get_clock().now().to_msg()
+                    self.msg_cam_info.header.stamp = msg.header.stamp
                     msg.header.frame_id = "camera"
-                    self.publisher_.publish(msg)
-                    self.info_set()
-                except CvBridgeError as e:
-                    print(e)
-                frame_id_ = frame_id_ + 1
-            
-            if cv.waitKey(1) & 0xFF == ord("q"):
-                break
-
-            
+                    self.publisher_rect.publish(msg)
+                    msg_ = bridge.cv2_to_imgmsg(np.array(frame), "bgr8")
+                    msg.data = msg_.data
+                    self.publisher_raw.publish(msg)
+                    self.publisher_info.publish(self.msg_cam_info)
+                except CvBridgeError as err:
+                    print(err)
 
 
 def main():
@@ -103,14 +113,9 @@ def main():
         rclpy.spin(camera_publisher)
     except KeyboardInterrupt:
         pass
-
-    camera_publisher.destroy_node()
-    rclpy.shutdown()
+    finally:
+        camera_publisher.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
-
-
-            
-
-
